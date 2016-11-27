@@ -1,12 +1,9 @@
 {
-  "name": "dataparser",
-  "version": "1.0.0",
+  "name": "xlsx-to-database",
+  "version": "0.1.0",
   "description": "",
   "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "author": "",
+  "author": "andrew@starostin.one",
   "license": "ISC",
   "dependencies": {
     "async": "^2.1.2",
@@ -15,5 +12,9 @@
     "pg-copy-streams": "^1.2.0",
     "xlsx": "^0.8.0",
     "xlsx-stream-reader": ["mayorandrew/xlsx-stream-reader", "^0.9.8"]
+  },
+  "repository": {
+  	"type": "git",
+  	"url": "https://github.com/mayorandrew/xlsx-to-database.git"
   }
 }
