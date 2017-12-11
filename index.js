@@ -3,23 +3,50 @@ const path = require('path');
 const copyFrom = require('pg-copy-streams').from;
 const XlsxStreamReader = require('xlsx-stream-reader');
 const fs = require('fs');
-const csvParse = require('csv-parse');
+const firstline = require('firstline');
 
-if (process.argv.length < 4) {
-    console.log('Usage: node index.js [config] [filename] [drop/nodrop] [table_name]');
-    console.log('Example: node index.js config-vo data/20170623/temp_headers.xlsx nodrop');
-    console.log('Example: node index.js config-vo data/20170623/temp_info_head.xlsx drop');
-    return;
-}
+const argv = require('yargs')
+	.option('config', {
+		alias: 'c',
+		required: true
+	})
+	.option('filename', {
+		alias: 'f',
+		required: true
+	})
+	.option('drop', {
+		alias: 'd',
+		default: false,
+		type: 'boolean'
+	})
+	.option('table', {
+		alias: 't',
+		default: [],
+		type: 'array'
+	})
+	.option('prefix', {
+		alias: 'p',
+		default: ''
+	})
+	.option('separator', {
+		alias: 's',
+		default: '|'
+	})
+	.option('batch_size', {
+		alias: 'b',
+		default: 2000
+	})
+	.argv;
 
-const sheetNamePrefix = '';
-const csvSeparator = '|';
-const config = require('./' + process.argv[2] + '.js');
+const sheetNamePrefix = argv.prefix;
+const csvSeparator = argv.separator;
+const config = require('./' + argv.config + '.js');
 const dbSchema = config.schema;
-const filename = process.argv[3];
+const filename = argv.filename;
 const extension = path.extname(filename);
-const drop = process.argv[4] == 'drop';
-const tableName = process.argv[5];
+const drop = argv.drop;
+const tables = argv.table;
+const batchSize = argv.batch_size;
 
 const quote = n => "'" + n + "'";
 const doubleQuote = n => `"${n}"`;
@@ -40,24 +67,49 @@ poolPromise
 			});
         }
 
-        if (extension == '.csv') {
+        function recreateTable(tableName, tableFields) {
+			let tableFieldsCreation = tableFields.map(f => `"${f}" text`);
+			if (drop) {
+				return client.query(`DROP TABLE IF EXISTS ${tableName}`)
+					.then(() => {
+						console.log(`table ${tableName} dropped`);
+						console.log(`Creating table ${tableName}(${tableFieldsCreation})`);
+						return client.query(`CREATE TABLE ${tableName} ( ${tableFieldsCreation} )`);
+					})
+					.then(() => {
+						console.log(`table ${tableName} created`);
+					});
+			}
+			console.log(`Creating table ${tableName}(${tableFieldsCreation})`);
+			return client.query(`CREATE TABLE IF NOT EXISTS ${tableName} ( ${tableFieldsCreation} )`)
+				.then(() => {
+					console.log(`table ${tableName} created`);
+				});
+		}
+
+        if (extension == '.csv' || extension == '.txt') {
 
             console.log(`Using direct copy from csv`);
 
-            if (!tableName) {
+            if (!tables || tables.length == 0) {
                 console.log(`Table name is required in csv mode`);
                 return closeConnection();
             }
 
-			let fileStream = fs.createReadStream(filename);
-
-			let copyStream = client.query(copyFrom(`COPY ${tableName} FROM STDIN WITH ( FORMAT 'csv', DELIMITER '${csvSeparator}', HEADER )`));
-
-			copyStream.on('end', () => {
-			    closeConnection();
-            });
-
-			fileStream.pipe(copyStream);
+            let tableName = sheetNamePrefix + tables[0];
+            let tableFields = null;
+            firstline(filename)
+				.then((header) => {
+					tableFields = header.split(csvSeparator).map(t => t.trim());
+					return recreateTable(tableName, tableFields);
+				})
+				.then(() => {
+					let fileStream = fs.createReadStream(filename);
+					let tableFieldsNames = tableFields.map(doubleQuote).join(',');
+					let copyStream = client.query(copyFrom(`COPY ${tableName}(${tableFieldsNames}) FROM STDIN WITH ( FORMAT 'csv', DELIMITER '${csvSeparator}', HEADER )`));
+					copyStream.on('end', () => closeConnection());
+					fileStream.pipe(copyStream);
+				});
 
         } else if (extension == '.xlsx') {
 
@@ -94,7 +146,7 @@ poolPromise
 						tableFields.forEach((col, iCol) => {
 							let v = row[iCol];
 							if (v != null) {
-								copyStream.write(quoteCsv(v));
+								copyStream.write(quoteCsv(v.trim()));
 							}
 							if (iCol < tableFields.length - 1) {
 								copyStream.write(',');
@@ -114,7 +166,6 @@ poolPromise
 					return promise;
 				}
 
-				console.log('\nSheet ' + quote(sheetName));
 				sheetReader.on('end', () => {
 					if (insertValues.length > 0) {
 						sheetReader.pause();
@@ -125,59 +176,45 @@ poolPromise
 					}
 				});
 
-				sheetReader.on('row', row => {
-					if (row.attributes.r == 1) {
-						tableFields = row.values.slice(1);
+				if (tables.length == 0 || tables.indexOf(sheetName) >= 0) {
+					sheetReader.on('row', row => {
+						if (row.attributes.r == 1) {
+							tableFields = row.values.slice(1);
 
-						while (tableFields.length > 0 && !tableFields[tableFields.length - 1]) {
-							tableFields = tableFields.slice(0, tableFields.length - 1);
-						}
+							while (tableFields.length > 0 && (!tableFields[tableFields.length - 1] || !tableFields[tableFields.length - 1].trim())) {
+								tableFields = tableFields.slice(0, tableFields.length - 1);
+							}
 
-						if (tableFields.length == 0) {
-							let error = `Empty table header discovered for table ${tableName}`;
-							console.log(error);
-							throw new Error(error);
-						}
+							if (tableFields.length == 0) {
+								let error = `Empty table header discovered for table ${tableName}`;
+								console.log(error);
+								throw new Error(error);
+							}
 
-						tableFieldsNames = tableFields.map(doubleQuote).join(',');
-						valuesQuery = '(' + tableFields.map((f, i) => `$${i + 1}::text`).join(',') + ')';
+							tableFieldsNames = tableFields.map(doubleQuote).join(',');
+							valuesQuery = '(' + tableFields.map((f, i) => `$${i + 1}::text`).join(',') + ')';
 
-						let tableFieldsCreation = tableFields.map(f => `"${f}" text`);
-
-						sheetReader.pause();
-						if (drop) {
-							client.query(`DROP TABLE IF EXISTS ${tableName}`)
-								.then(() => {
-									console.log(`table ${tableName} dropped`);
-									return client.query(`CREATE TABLE ${tableName} ( ${tableFieldsCreation} )`);
-								})
-								.then(() => {
-									console.log(`table ${tableName} created`);
-									sheetReader.resume();
-								});
-						} else {
-							client.query(`CREATE TABLE IF NOT EXISTS ${tableName} ( ${tableFieldsCreation} )`)
-								.then((res) => {
-									if (res.rowCount) {
-										console.log(`table ${tableName} updated`);
-									}
-									console.log(tableFieldsNames);
-									sheetReader.resume();
-								});
-						}
-					} else {
-						insertValues.push(row.values.slice(1));
-						if (insertValues.length > 1000) {
 							sheetReader.pause();
-							doInsert(insertValues).then(() => {
-								sheetReader.resume();
-							});
-							insertValues = [];
-						}
-					}
-				});
 
-				sheetReader.process();
+							recreateTable(tableName, tableFields)
+								.then(() => sheetReader.resume());
+						} else {
+							insertValues.push(row.values.slice(1));
+							if (insertValues.length >= batchSize) {
+								sheetReader.pause();
+								doInsert(insertValues).then(() => {
+									sheetReader.resume();
+								});
+								insertValues = [];
+							}
+						}
+					});
+					console.log('\nSheet ' + quote(sheetName));
+					sheetReader.process();
+				} else {
+					console.log('\nIgnoring sheet ' + quote(sheetName));
+					sheetReader.skip();
+				}
 			});
 
 
