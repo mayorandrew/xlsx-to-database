@@ -1,9 +1,11 @@
-const pg = require('pg');
+const csv = require('csv');
 const path = require('path');
-const copyFrom = require('pg-copy-streams').from;
 const XlsxStreamReader = require('xlsx-stream-reader');
 const fs = require('fs');
 const firstline = require('firstline');
+
+const dbConnector = require('./dbConnector');
+const {quote, doubleQuote, quoteCsv} = require('./util');
 
 const argv = require('yargs')
 	.option('config', {
@@ -30,7 +32,7 @@ const argv = require('yargs')
 	})
 	.option('separator', {
 		alias: 's',
-		default: '|'
+		default: ','
 	})
 	.option('batch_size', {
 		alias: 'b',
@@ -41,79 +43,76 @@ const argv = require('yargs')
 const sheetNamePrefix = argv.prefix;
 const csvSeparator = argv.separator;
 const config = require('./' + argv.config + '.js');
-const dbSchema = config.schema;
+
+const db = dbConnector(config);
+
 const filename = argv.filename;
 const extension = path.extname(filename);
 const drop = argv.drop;
 const tables = argv.table;
 const batchSize = argv.batch_size;
 
-const quote = n => "'" + n + "'";
-const doubleQuote = n => `"${n}"`;
-const quoteCsv = n => '"' + n.replace(/\"/g, '\"\"').replace(/[\r\n]/g, '') + '"'
+db.connect()
+	.then(() => {
 
-let pool = new pg.Pool(config);
-let poolPromise = pool.connect();
+		function closeConnection() {
+			db.close();
+		}
 
-poolPromise
-    .then(client =>
-        client.query(`set search_path to ${dbSchema}`).then(() => client)
-    )
-    .then(client => {
-
-        function closeConnection() {
-			client.end(error => {
-				if (error) throw error;
-			});
-        }
-
-        function recreateTable(tableName, tableFields) {
+		function recreateTable(tableName, tableFields) {
 			let tableFieldsCreation = tableFields.map(f => `"${f}" text`);
 			if (drop) {
-				return client.query(`DROP TABLE IF EXISTS ${tableName}`)
+				return db.dropTable(tableName)
 					.then(() => {
 						console.log(`table ${tableName} dropped`);
 						console.log(`Creating table ${tableName}(${tableFieldsCreation})`);
-						return client.query(`CREATE TABLE ${tableName} ( ${tableFieldsCreation} )`);
+						return db.createTable(tableName, tableFields);
 					})
 					.then(() => {
 						console.log(`table ${tableName} created`);
 					});
 			}
 			console.log(`Creating table ${tableName}(${tableFieldsCreation})`);
-			return client.query(`CREATE TABLE IF NOT EXISTS ${tableName} ( ${tableFieldsCreation} )`)
+			return db.createTable(tableName, tableFields, true)
 				.then(() => {
 					console.log(`table ${tableName} created`);
 				});
 		}
 
-        if (extension == '.csv' || extension == '.txt') {
+		if (extension == '.csv' || extension == '.txt') {
+			console.log(`Using direct copy from csv`);
 
-            console.log(`Using direct copy from csv`);
+			if (!tables || tables.length == 0) {
+				console.log(`Table name is required in csv mode`);
+				return closeConnection();
+			}
 
-            if (!tables || tables.length == 0) {
-                console.log(`Table name is required in csv mode`);
-                return closeConnection();
-            }
-
-            let tableName = sheetNamePrefix + tables[0];
-            let tableFields = null;
-            firstline(filename)
+			let tableName = sheetNamePrefix + tables[0];
+			let tableFields = null;
+			firstline(filename)
 				.then((header) => {
-					tableFields = header.split(csvSeparator).map(t => t.trim());
-					return recreateTable(tableName, tableFields);
+					return new Promise((resolve, reject) => {
+						csv.parse(header, {
+							delimiter: csvSeparator
+						}, (err, data) => {
+							if (err) return reject(err);
+							resolve(data[0]);
+						});
+					})
+						.then((tableFields_) => {
+							tableFields = tableFields_;
+							return recreateTable(tableName, tableFields);
+						});
 				})
 				.then(() => {
 					let fileStream = fs.createReadStream(filename);
-					let tableFieldsNames = tableFields.map(doubleQuote).join(',');
-					let copyStream = client.query(copyFrom(`COPY ${tableName}(${tableFieldsNames}) FROM STDIN WITH ( FORMAT 'csv', DELIMITER '${csvSeparator}', HEADER )`));
-					copyStream.on('end', () => closeConnection());
-					fileStream.pipe(copyStream);
+					db.readCsvFileStream(tableName, tableFields, fileStream, csvSeparator)
+						.then(() => closeConnection());
 				});
 
-        } else if (extension == '.xlsx') {
+		} else if (extension == '.xlsx') {
 
-            console.log(`Using xlsx stream reader`);
+			console.log(`Using xlsx stream reader`);
 
 			let bookReader = new XlsxStreamReader();
 
@@ -138,32 +137,7 @@ poolPromise
 					numInsert++;
 					let numRows = insertValues.length;
 					console.log(`inserting ${numRows} values to ${tableName} [${numInsert}]`);
-					let copyStream = client.query(copyFrom(`COPY ${tableName}(${tableFieldsNames}) FROM STDIN WITH ( FORMAT 'csv', DELIMITER ',' )`));
-					// let copyStream = fs.createWriteStream(`${tableName}.csv`);
-					// copyStream.write(tableFieldsNames);
-					// copyStream.write('\n');
-					insertValues.forEach((row, iRow) => {
-						tableFields.forEach((col, iCol) => {
-							let v = row[iCol];
-							if (v != null) {
-								copyStream.write(quoteCsv(v.trim()));
-							}
-							if (iCol < tableFields.length - 1) {
-								copyStream.write(',');
-							}
-						});
-						if (iRow < numRows - 1) {
-							copyStream.write('\n');
-						}
-					});
-
-					let promise = new Promise((resolve) => {
-						copyStream.on('end', resolve);
-					});
-
-					copyStream.end();
-
-					return promise;
+					return db.insertValues(tableName, tableFields, insertValues);
 				}
 
 				sheetReader.on('end', () => {
@@ -223,10 +197,10 @@ poolPromise
 
 		} else {
 
-            console.log(`Unknown extension ${extension}`);
-            closeConnection();
+			console.log(`Unknown extension ${extension}`);
+			closeConnection();
 
-        }
+		}
 
-    });
+	});
 
