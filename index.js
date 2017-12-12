@@ -173,13 +173,16 @@ db.connect()
 							recreateTable(tableName, tableFields)
 								.then(() => sheetReader.resume());
 						} else {
-							insertValues.push(row.values.slice(1));
-							if (insertValues.length >= batchSize) {
-								sheetReader.pause();
-								doInsert(insertValues).then(() => {
-									sheetReader.resume();
-								});
-								insertValues = [];
+							let rowValues = row.values.slice(1);
+							if (rowValues.find(t => t != null && t !== '') != null) {
+								insertValues.push(rowValues.slice(0, tableFields.length));
+								if (insertValues.length >= batchSize) {
+									sheetReader.pause();
+									doInsert(insertValues).then(() => {
+										sheetReader.resume();
+									});
+									insertValues = [];
+								}
 							}
 						}
 					});
