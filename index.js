@@ -116,12 +116,16 @@ db.connect()
 
 			let bookReader = new XlsxStreamReader();
 
+			let finalInsertPromise = Promise.resolve();
+
 			bookReader.on('error', error => {
 				throw(error);
 			});
 
 			bookReader.on('end', () => {
-				closeConnection();
+        finalInsertPromise.then(() => {
+          closeConnection();
+        });
 			});
 
 			bookReader.on('worksheet', sheetReader => {
@@ -143,7 +147,7 @@ db.connect()
 				sheetReader.on('end', () => {
 					if (insertValues.length > 0) {
 						sheetReader.pause();
-						doInsert(insertValues).then(() => {
+            finalInsertPromise = doInsert(insertValues).then(() => {
 							sheetReader.resume();
 						});
 						insertValues = [];
@@ -178,7 +182,7 @@ db.connect()
 								insertValues.push(rowValues.slice(0, tableFields.length));
 								if (insertValues.length >= batchSize) {
 									sheetReader.pause();
-									doInsert(insertValues).then(() => {
+									finalInsertPromise = doInsert(insertValues).then(() => {
 										sheetReader.resume();
 									});
 									insertValues = [];
