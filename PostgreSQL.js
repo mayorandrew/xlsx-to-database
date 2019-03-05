@@ -8,7 +8,8 @@ class PostgreSQL {
 		this.database = config.database;
 		this.user = config.user;
 		this.password = config.password;
-		this.host = config.host;
+    this.host = config.host;
+    this.port = config.port;
 	}
 
 	connect() {
@@ -16,10 +17,11 @@ class PostgreSQL {
 			database: this.database,
 			user: this.user,
 			password: this.password,
-			host: this.host
+			host: this.host,
+			port: this.port
 		});
 
-		return pool.connect()
+		return this.pool.connect()
 			.then((client) => {
 				this.client = client;
 				return client.query(`set search_path to ${this.schema}`);
